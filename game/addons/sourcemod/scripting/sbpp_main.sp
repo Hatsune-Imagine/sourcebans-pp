@@ -148,6 +148,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max
 
 	CreateNative("SBBanPlayer", Native_SBBanPlayer);
 	CreateNative("SBPP_BanPlayer", Native_SBBanPlayer);
+	CreateNative("SBPP_BanPlayerBySteamId", Native_SBPP_BanPlayerBySteamId);
 	CreateNative("SBPP_ReportPlayer", Native_SBReportPlayer);
 
 	g_hFwd_OnBanAdded = CreateGlobalForward("SBPP_OnBanPlayer", ET_Ignore, Param_Cell, Param_Cell, Param_Cell, Param_String);
@@ -2417,6 +2418,194 @@ public int Native_SBBanPlayer(Handle plugin, int numParams)
 
 	PrepareBan(client, target, time, reason);
 	return true;
+}
+
+public int Native_SBPP_BanPlayerBySteamId(Handle plugin, int numParams)
+{
+	if (DB == INVALID_HANDLE)
+	{
+		ThrowNativeError(SP_ERROR_NATIVE, "SourceBans++ database is not available.");
+		return 0;
+	}
+
+	int admin = GetNativeCell(1);
+	int iTime = GetNativeCell(4);
+
+	if (admin < 0 || admin > MaxClients)
+	{
+		ThrowNativeError(SP_ERROR_NATIVE, "SBPP_BanPlayerBySteamId: iAdmin must be 0 or a valid client index.");
+		return 0;
+	}
+
+	if (iTime < 0)
+	{
+		ThrowNativeError(SP_ERROR_NATIVE, "SBPP_BanPlayerBySteamId: iTime cannot be negative.");
+		return 0;
+	}
+
+	if (admin != 0)
+	{
+		if (!IsClientInGame(admin))
+		{
+			ThrowNativeError(SP_ERROR_NATIVE, "Ban Error: Player is not in game.");
+			return 0;
+		}
+
+		AdminId aid = GetUserAdmin(admin);
+		if (aid == INVALID_ADMIN_ID)
+		{
+			ThrowNativeError(SP_ERROR_NATIVE, "Ban Error: Player is not an admin.");
+			return 0;
+		}
+
+		if (!aid.HasFlag(Admin_Ban))
+		{
+			ThrowNativeError(SP_ERROR_NATIVE, "Ban Error: Player does not have BAN flag.");
+			return 0;
+		}
+	}
+
+	char steamId[MAX_AUTHID_LENGTH], name[MAX_NAME_LENGTH], reason[128];
+	GetNativeString(2, steamId, sizeof(steamId));
+	GetNativeString(3, name, sizeof(name));
+	GetNativeString(5, reason, sizeof(reason));
+
+	char validatedSteam3[MAX_AUTHID_LENGTH];
+	if (!Steam2ToSteam3(steamId, validatedSteam3, sizeof(validatedSteam3)))
+	{
+		ThrowNativeError(SP_ERROR_NATIVE, "SBPP_BanPlayerBySteamId: steamId must be in SteamID2 format (STEAM_[01]:[01]:Z), got: %s", steamId);
+		return 0;
+	}
+
+	if (reason[0] == '\0')
+		strcopy(reason, sizeof(reason), "Banned by SourceBans");
+
+	char adminAuth[MAX_AUTHID_LENGTH], adminIp[16];
+	if (admin == 0)
+	{
+		strcopy(adminAuth, sizeof(adminAuth), "STEAM_ID_SERVER");
+		strcopy(adminIp, sizeof(adminIp), ServerIp);
+	}
+	else
+	{
+		strcopy(adminAuth, sizeof(adminAuth), g_sSteamIDs[admin]);
+		strcopy(adminIp, sizeof(adminIp), g_sPlayerIP[admin]);
+	}
+
+	DataPack pack = new DataPack();
+	pack.WriteCell(admin == 0 ? 0 : GetClientUserId(admin));
+	pack.WriteCell(iTime);
+	pack.WriteString(reason);
+	pack.WriteString(steamId);
+	pack.WriteString(name);
+	pack.WriteString(adminAuth);
+	pack.WriteString(adminIp);
+
+	char steamIdEscaped[MAX_AUTHID_LENGTH * 2 + 1], steamIdYzEscaped[MAX_AUTHID_LENGTH * 2 + 1];
+	DB.Escape(steamId, steamIdEscaped, sizeof(steamIdEscaped));
+	DB.Escape(steamId[8], steamIdYzEscaped, sizeof(steamIdYzEscaped));
+
+	char query[512];
+	FormatEx(query, sizeof(query), "SELECT bid FROM %s_bans WHERE type = 0 AND (authid = '%s' OR authid REGEXP '^STEAM_[0-9]:%s$') AND (length = 0 OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL",
+		DatabasePrefix, steamIdEscaped, steamIdYzEscaped);
+
+	DB.Query(DB_OnBanBySteamIdSelect, query, pack, DBPrio_High);
+
+	return 0;
+}
+
+void DB_OnBanBySteamIdSelect(Database db, DBResultSet results, const char[] error, DataPack pack)
+{
+	if (results == null)
+	{
+		LogToFile(logFile, "[SBPP] BanPlayerBySteamId select failed: %s", error);
+		delete pack;
+		return;
+	}
+
+	pack.Reset();
+	int adminUserId = pack.ReadCell();
+	int iTime = pack.ReadCell();
+	char reason[128], steamId[MAX_AUTHID_LENGTH], name[MAX_NAME_LENGTH], adminAuth[MAX_AUTHID_LENGTH], adminIp[16];
+	pack.ReadString(reason, sizeof(reason));
+	pack.ReadString(steamId, sizeof(steamId));
+	pack.ReadString(name, sizeof(name));
+	pack.ReadString(adminAuth, sizeof(adminAuth));
+	pack.ReadString(adminIp, sizeof(adminIp));
+	delete pack;
+
+	if (results.RowCount > 0)
+	{
+		LogToFile(logFile, "[SBPP] BanPlayerBySteamId: %s is already banned, skipping.", steamId);
+		return;
+	}
+
+	char steamIdEscaped[MAX_AUTHID_LENGTH * 2 + 1], nameEscaped[MAX_NAME_LENGTH * 2 + 1], reasonEscaped[256],
+		adminAuthEscaped[MAX_AUTHID_LENGTH * 2 + 1], adminAuthYzEscaped[MAX_AUTHID_LENGTH * 2 + 1], adminIpEscaped[33];
+	if (!db.Escape(steamId, steamIdEscaped, sizeof(steamIdEscaped))
+		|| !db.Escape(name, nameEscaped, sizeof(nameEscaped))
+		|| !db.Escape(reason, reasonEscaped, sizeof(reasonEscaped))
+		|| !db.Escape(adminAuth, adminAuthEscaped, sizeof(adminAuthEscaped))
+		|| !db.Escape(adminAuth[8], adminAuthYzEscaped, sizeof(adminAuthYzEscaped))
+		|| !db.Escape(adminIp, adminIpEscaped, sizeof(adminIpEscaped)))
+	{
+		LogToFile(logFile, "[SBPP] BanPlayerBySteamId failed to escape ban data for %s", steamId);
+		return;
+	}
+
+	char query[1024];
+	if (serverID == -1)
+	{
+		FormatEx(query, sizeof(query), "INSERT INTO %s_bans (authid, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
+			('%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', \
+			IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^STEAM_[0-9]:%s$'),'0'), '%s', \
+			(SELECT sid FROM %s_servers WHERE ip = '%s' AND port = '%s' LIMIT 0,1), ' ')",
+			DatabasePrefix, steamIdEscaped, nameEscaped, (iTime * 60), (iTime * 60), reasonEscaped,
+			DatabasePrefix, adminAuthEscaped, adminAuthYzEscaped, adminIpEscaped,
+			DatabasePrefix, ServerIpEscaped, ServerPort);
+	}
+	else
+	{
+		FormatEx(query, sizeof(query), "INSERT INTO %s_bans (authid, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
+			('%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', \
+			IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^STEAM_[0-9]:%s$'),'0'), '%s', \
+			%d, ' ')",
+			DatabasePrefix, steamIdEscaped, nameEscaped, (iTime * 60), (iTime * 60), reasonEscaped,
+			DatabasePrefix, adminAuthEscaped, adminAuthYzEscaped, adminIpEscaped,
+			serverID);
+	}
+
+	DataPack fwdPack = new DataPack();
+	fwdPack.WriteCell(adminUserId);
+	fwdPack.WriteCell(iTime);
+	fwdPack.WriteString(reason);
+
+	db.Query(DB_OnBanBySteamIdInsert, query, fwdPack, DBPrio_High);
+}
+
+void DB_OnBanBySteamIdInsert(Database db, DBResultSet results, const char[] error, DataPack pack)
+{
+	pack.Reset();
+	int adminUserId = pack.ReadCell();
+	int iTime = pack.ReadCell();
+	char reason[128];
+	pack.ReadString(reason, sizeof(reason));
+	delete pack;
+
+	if (results == null)
+	{
+		LogToFile(logFile, "[SBPP] BanPlayerBySteamId insert failed: %s", error);
+		return;
+	}
+
+	int admin = adminUserId == 0 ? 0 : GetClientOfUserId(adminUserId);
+
+	Call_StartForward(g_hFwd_OnBanAdded);
+	Call_PushCell(admin);
+	Call_PushCell(-1);
+	Call_PushCell(iTime);
+	Call_PushString(reason);
+	Call_Finish();
 }
 
 public int Native_SBReportPlayer(Handle plugin, int numParams)
